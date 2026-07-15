@@ -11,7 +11,12 @@ repositories {
 }
 
 dependencies {
+    api(platform("com.squareup.okhttp3:okhttp-bom:5.4.0"))
+    api("com.squareup.okhttp3:okhttp")
+
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    implementation("org.jsoup:jsoup:1.22.2")
     testImplementation(kotlin("test"))
 }
 

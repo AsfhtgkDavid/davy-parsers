@@ -1,5 +1,5 @@
 package dev.daika.davyparsers
 
 interface Parser {
-    fun parse(iframeUrl: String): PlayerData
+    suspend fun parse(iframeUrl: String): PlayerData?
 }
