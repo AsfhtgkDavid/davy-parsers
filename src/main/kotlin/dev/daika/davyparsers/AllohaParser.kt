@@ -13,12 +13,15 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
-const val userAgent =
+private const val userAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-const val acceptLanguage = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+private const val acceptLanguage = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 
+/** Parses an Alloha iframe URL into structured player data. */
 class AllohaParser(private val client: OkHttpClient) : Parser {
     private val json = Json { ignoreUnknownKeys = true }
+
+    /** Loads playback metadata and converts it to [PlayerData]. */
     override suspend fun parse(iframeUrl: String): PlayerData? {
         val requestIframe = Request.Builder().url(iframeUrl)
             .addHeader("Referer", "https://old.yummyani.me/")
