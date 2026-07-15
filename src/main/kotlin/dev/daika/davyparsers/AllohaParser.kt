@@ -4,11 +4,9 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -17,28 +15,30 @@ private const val userAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 private const val acceptLanguage = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 
-/** Parses an Alloha iframe URL into structured player data. */
+/** A parser implementation for the Alloha player source. */
 class AllohaParser(private val client: OkHttpClient) : Parser {
     private val json = Json { ignoreUnknownKeys = true }
 
     /** Loads playback metadata and converts it to [PlayerData]. */
-    override suspend fun parse(iframeUrl: String): PlayerData? {
+    override suspend fun parse(iframeUrl: String, referer: String): PlayerData {
         val requestIframe = Request.Builder().url(iframeUrl)
-            .addHeader("Referer", "https://old.yummyani.me/")
+            .addHeader("Referer", referer)
             .addHeader("User-Agent", userAgent)
             .addHeader("Accept-Language", acceptLanguage)
             .build()
         val callIframe = client.newCall(requestIframe)
         val doc = callIframe.await().use { response ->
             if (!response.isSuccessful) {
-                return@parse null
+                throw AllohaApiException("Failed to fetch iframe content.")
             }
             response.body.use { body ->
                 Jsoup.parse(body.byteStream(), "UTF-8", response.request.url.toString())
             }
         }
-        val wl = doc.selectFirst("meta[name=viewporti]")?.attr("content") ?: return null
-        val token = iframeUrl.toHttpUrlOrNull()?.queryParameter("token") ?: return null
+        val wl = doc.selectFirst("meta[name=viewporti]")?.attr("content")
+            ?: throw AllohaParsingException("Missing viewport metadata required for request signing.")
+        val token = iframeUrl.toHttpUrlOrNull()?.queryParameter("token")
+            ?: throw AllohaParsingException("Missing 'token' query parameter in iframe URL.")
         val aj = a6(a7(wl))
         val borth = "a|" + unscramble(aj)
 
@@ -53,17 +53,23 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
             .addHeader("Referer", iframeUrl)
             .addHeader("Origin", "https://alloha.yani.tv")
             .addHeader("Accept-Language", acceptLanguage)
-//            .addHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
             .build()
         val callM3u8 = client.newCall(requestM3u8)
 
-        val bnsiDto: AllohaBnsiDto
-        callM3u8.await().use { response ->
+        val bnsiDto = callM3u8.await().use { response ->
             if (!response.isSuccessful) {
-                return null
+                throw AllohaApiException("Alloha BNSI request failed with HTTP ${response.code}.")
             }
-            bnsiDto = response.body.use { body ->
-                json.decodeFromString<AllohaBnsiDto>(body.string())
+            response.body.use { body ->
+                val rawBody = body.string()
+                if (rawBody.isBlank()) {
+                    throw AllohaApiException("Alloha BNSI response body is empty.")
+                }
+                try {
+                    json.decodeFromString<AllohaBnsiDto>(rawBody)
+                } catch (e: Exception) {
+                    throw AllohaParsingException("Failed to decode Alloha BNSI response JSON.", e)
+                }
             }
         }
 
@@ -103,25 +109,24 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         )
     }
 
-    private fun getActiveId(doc: Document): Int? {
+    private fun getActiveId(doc: Document): Int {
         val regex = """const\s+fileList\s*=\s*JSON\.parse\(\s*(["'`])(.*?)\1\s*\)"""
             .toRegex(RegexOption.DOT_MATCHES_ALL)
 
         val scriptContent = doc.select("script")
             .map { it.data() }
             .firstOrNull { it.contains("const fileList") }
-            ?: return null
-        val jsonString: String
-        try {
-            jsonString = regex.find(scriptContent)?.groupValues?.get(2) ?: return null
-        } catch (e: IndexOutOfBoundsException) {
-            return null
-        }
+            ?: throw AllohaParsingException("Failed to find active media id in Alloha script payload.")
+        val jsonString = regex.find(scriptContent)?.groupValues?.get(2)
+            ?: throw AllohaParsingException("Failed to extract JSON from Alloha script.")
         val cleanJson = jsonString
             .replace("\\\"", "\"")
             .replace("\\\\", "\\")
-        val fileList = json.decodeFromString<AllohaFileListDto>(cleanJson)
-        return fileList.active.id
+        return try {
+            json.decodeFromString<AllohaFileListDto>(cleanJson).active.id
+        } catch (_: Exception) {
+            throw AllohaParsingException("Failed to decode Alloha BNSI response JSON.")
+        }
     }
 
     private fun a6(s: String): String {
@@ -213,7 +218,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
     }
 
 
-    fun isPrime(n: Int): Boolean {
+    private fun isPrime(n: Int): Boolean {
         if (n < 2) return false
         if (n % 2 == 0) return n == 2
         var i = 3
@@ -224,7 +229,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         return true
     }
 
-    fun getNextPrime(n: Int): Int {
+    private fun getNextPrime(n: Int): Int {
         var c = maxOf(1, n)
         while (!isPrime(c)) {
             c++
@@ -291,3 +296,11 @@ private data class AllohaTrackDto(
     @SerialName("default")
     val isDefault: Boolean
 )
+
+private sealed class AllohaParserException(message: String, cause: Throwable? = null) :
+    RuntimeException(message, cause)
+
+private class AllohaApiException(message: String) : AllohaParserException(message)
+
+private class AllohaParsingException(message: String, cause: Throwable? = null) :
+    AllohaParserException(message, cause)
