@@ -28,7 +28,6 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
 
     }
 
-    /** Loads playback metadata and converts it to [PlayerData]. */
     override suspend fun parse(iframeUrl: String, referer: String): PlayerData {
         val iframeDocument = loadIframeDocument(iframeUrl, referer)
         val requestSeed = iframeDocument.selectFirst("meta[name=viewporti]")?.attr("content")
@@ -38,6 +37,10 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         val activeId = extractActiveId(iframeDocument)
         val bnsiDto = fetchBnsiData(activeId, token, borth, iframeUrl)
         return mapPlayerData(bnsiDto)
+    }
+
+    override fun canParse(iframeUrl: String): Boolean {
+        return iframeUrl.contains("alloha.yani.tv")
     }
 
     private suspend fun loadIframeDocument(iframeUrl: String, referer: String): Document {

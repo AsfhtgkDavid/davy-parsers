@@ -91,6 +91,10 @@ class KodikParser(client: OkHttpClient) : Parser {
         )
     }
 
+    override fun canParse(iframeUrl: String): Boolean {
+        return iframeUrl.contains("kodikplayer.com")
+    }
+
     private suspend fun fetchVideoData(
         targetUrl: String,
         type: String,
