@@ -18,7 +18,7 @@ private val json = Json { ignoreUnknownKeys = true }
 /** A parser implementation for the Kodik player source. */
 class KodikParser(client: OkHttpClient) : Parser {
     private val client: OkHttpClient = client.newBuilder().cookieJar(InMemoryCookieJar()).build()
-    override suspend fun parse(iframeUrl: String, referer: String): PlayerData? {
+    override suspend fun parse(iframeUrl: String, referer: String): PlayerData {
         val requestIframe = Request.Builder().url(iframeUrl).addHeader(
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -35,7 +35,7 @@ class KodikParser(client: OkHttpClient) : Parser {
         var hashContainer: KodikHashContainer
         callIframe.await().use { response ->
             if (!response.isSuccessful) {
-                return@parse null
+                throw KodikApiException("Failed to fetch iframe content")
             }
 
             response.body.use { body ->
@@ -245,23 +245,30 @@ class KodikParser(client: OkHttpClient) : Parser {
     }
 
     private fun parseSkipSegments(html: String): List<TimeInterval> {
-        // Extract quoted parseSkipButton payload.
         val regex = Regex("""parseSkipButton\(\s*['"](.*?)['"]""")
         val match = regex.find(html) ?: return emptyList()
 
-        // Example payload: "[opening]230-319,[ending]1407-1426".
         val skipStr = match.groupValues[1]
 
         return skipStr.split(",").mapNotNull { segment ->
-            // Drop tags like [opening] and keep only numeric ranges.
             val rangeStr = segment.replace(Regex("""\[.*?\]"""), "")
             val range = rangeStr.split("-")
 
             if (range.size == 2) {
-                TimeInterval(start = range[0].toLong(), end = range[1].toLong())
+                TimeInterval(start = timeToSeconds(range[0]), end = timeToSeconds(range[1]))
             } else {
                 null
             }
+        }
+    }
+
+    private fun timeToSeconds(timeStr: String): Long {
+        val parts = timeStr.split(":").map { it.toLongOrNull() ?: 0L }
+        return when (parts.size) {
+            3 -> parts[0] * 3600 + parts[1] * 60 + parts[2]
+            2 -> parts[0] * 60 + parts[1]
+            1 -> parts[0]
+            else -> 0L
         }
     }
 
@@ -323,12 +330,12 @@ private data class KodikSubtitleDto(
     val src: String
 )
 
-private sealed class KodikParserException(message: String, cause: Throwable? = null) :
-    RuntimeException(message, cause)
+sealed class KodikParserException(message: String, cause: Throwable? = null) :
+    ParserException(message, cause)
 
-private class KodikApiException(message: String) : KodikParserException(message)
+class KodikApiException(message: String) : KodikParserException(message)
 
-private class KodikParsingException(message: String, cause: Throwable? = null) :
+class KodikParsingException(message: String, cause: Throwable? = null) :
     KodikParserException(message, cause)
 
-private class KodikDecryptionException(message: String) : KodikParserException(message)
+class KodikDecryptionException(message: String) : KodikParserException(message)

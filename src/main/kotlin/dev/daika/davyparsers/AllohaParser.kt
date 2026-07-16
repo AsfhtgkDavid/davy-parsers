@@ -3,6 +3,7 @@ package dev.daika.davyparsers
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -14,57 +15,84 @@ import org.jsoup.nodes.Document
 private const val userAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 private const val acceptLanguage = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+private const val allohaOrigin = "https://alloha.yani.tv"
+private const val allohaBnsiPath = "$allohaOrigin/bnsi/movies"
+private val formMediaType = "application/x-www-form-urlencoded; charset=UTF-8".toMediaType()
+private val fileListRegex =
+    """const\s+fileList\s*=\s*JSON\.parse\(\s*(["'`])(.*?)\1\s*\)""".toRegex(RegexOption.DOT_MATCHES_ALL)
 
 /** A parser implementation for the Alloha player source. */
 class AllohaParser(private val client: OkHttpClient) : Parser {
-    private val json = Json { ignoreUnknownKeys = true }
+    private val json = Json {
+        ignoreUnknownKeys = true
+
+    }
 
     /** Loads playback metadata and converts it to [PlayerData]. */
     override suspend fun parse(iframeUrl: String, referer: String): PlayerData {
-        val requestIframe = Request.Builder().url(iframeUrl)
+        val iframeDocument = loadIframeDocument(iframeUrl, referer)
+        val requestSeed = iframeDocument.selectFirst("meta[name=viewporti]")?.attr("content")
+            ?: throw AllohaParsingException("Missing viewporti metadata required for request signing.")
+        val token = extractToken(iframeUrl)
+        val borth = buildBorthHeader(requestSeed)
+        val activeId = extractActiveId(iframeDocument)
+        val bnsiDto = fetchBnsiData(activeId, token, borth, iframeUrl)
+        return mapPlayerData(bnsiDto)
+    }
+
+    private suspend fun loadIframeDocument(iframeUrl: String, referer: String): Document {
+        val request = Request.Builder().url(iframeUrl)
             .addHeader("Referer", referer)
             .addHeader("User-Agent", userAgent)
             .addHeader("Accept-Language", acceptLanguage)
             .build()
-        val callIframe = client.newCall(requestIframe)
-        val doc = callIframe.await().use { response ->
+
+        return client.newCall(request).await().use { response ->
             if (!response.isSuccessful) {
                 throw AllohaApiException("Failed to fetch iframe content.")
             }
+
             response.body.use { body ->
                 Jsoup.parse(body.byteStream(), "UTF-8", response.request.url.toString())
             }
         }
-        val wl = doc.selectFirst("meta[name=viewporti]")?.attr("content")
-            ?: throw AllohaParsingException("Missing viewport metadata required for request signing.")
-        val token = iframeUrl.toHttpUrlOrNull()?.queryParameter("token")
-            ?: throw AllohaParsingException("Missing 'token' query parameter in iframe URL.")
-        val aj = a6(a7(wl))
-        val borth = "a|" + unscramble(aj)
+    }
 
-        val id = getActiveId(doc)
-        val requestM3u8 = Request.Builder().url("https://alloha.yani.tv/bnsi/movies/$id")
-            .post(
-                "token=$token&av1=false&autoplay=0&audio=&subtitle="
-                    .toRequestBody("application/x-www-form-urlencoded; charset=UTF-8".toMediaType())
-            )
+    private fun extractToken(iframeUrl: String): String {
+        return iframeUrl.toHttpUrlOrNull()?.queryParameter("token")
+            ?: throw AllohaParsingException("Missing 'token' query parameter in iframe URL.")
+    }
+
+    private fun buildBorthHeader(requestSeed: String): String {
+        return "a|" + decodeBorthSeed(requestSeed)
+    }
+
+    private suspend fun fetchBnsiData(
+        activeId: Int,
+        token: String,
+        borth: String,
+        iframeUrl: String
+    ): AllohaBnsiDto {
+        val request = Request.Builder().url("$allohaBnsiPath/$activeId")
+            .post(buildBnsiRequestBody(token))
             .addHeader("User-Agent", userAgent)
             .addHeader("Borth", borth)
             .addHeader("Referer", iframeUrl)
-            .addHeader("Origin", "https://alloha.yani.tv")
+            .addHeader("Origin", allohaOrigin)
             .addHeader("Accept-Language", acceptLanguage)
             .build()
-        val callM3u8 = client.newCall(requestM3u8)
 
-        val bnsiDto = callM3u8.await().use { response ->
+        return client.newCall(request).await().use { response ->
             if (!response.isSuccessful) {
                 throw AllohaApiException("Alloha BNSI request failed with HTTP ${response.code}.")
             }
+
             response.body.use { body ->
                 val rawBody = body.string()
                 if (rawBody.isBlank()) {
                     throw AllohaApiException("Alloha BNSI response body is empty.")
                 }
+
                 try {
                     json.decodeFromString<AllohaBnsiDto>(rawBody)
                 } catch (e: Exception) {
@@ -72,31 +100,28 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
                 }
             }
         }
+    }
 
+    private fun buildBnsiRequestBody(token: String) = FormBody.Builder()
+        .add("token", token)
+        .add("av1", "false")
+        .add("autoplay", "0")
+        .add("audio", "")
+        .add("subtitle", "")
+        .build()
+
+    private fun mapPlayerData(bnsiDto: AllohaBnsiDto): PlayerData {
         return PlayerData(
             translations = bnsiDto.hlsSource.map { source ->
                 Translation(
                     id = source.audioId,
                     name = source.label,
                     streams = source.quality.map { (quality, url) ->
-                        MediaStream(urls = url.split(" or ").map { it.trim() }, quality = quality)
+                        MediaStream(urls = parseUrls(url), quality = quality)
                     }
                 )
             },
-            skipTimes = bnsiDto.skipTime.split(",").mapNotNull { interval ->
-                val parts = interval.split("-")
-                if (parts.size == 2) {
-                    val start = parts[0].toLongOrNull()
-                    val end = parts[1].toLongOrNull()
-                    if (start != null && end != null) {
-                        TimeInterval(start, end)
-                    } else {
-                        null
-                    }
-                } else {
-                    null
-                }
-            },
+            skipTimes = parseSkipTimes(bnsiDto.skipTime),
             subtitles = bnsiDto.tracks?.map { track ->
                 SubtitleTrack(
                     kind = track.kind,
@@ -109,19 +134,40 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         )
     }
 
-    private fun getActiveId(doc: Document): Int {
-        val regex = """const\s+fileList\s*=\s*JSON\.parse\(\s*(["'`])(.*?)\1\s*\)"""
-            .toRegex(RegexOption.DOT_MATCHES_ALL)
+    private fun parseUrls(urls: String): List<String> {
+        return urls.split(" or ").map { it.trim() }
+    }
 
-        val scriptContent = doc.select("script")
+    private fun parseSkipTimes(skipTime: String): List<TimeInterval> {
+        return skipTime.split(",").mapNotNull { interval ->
+            val parts = interval.split("-")
+            if (parts.size != 2) {
+                return@mapNotNull null
+            }
+
+            val start = parts[0].toLongOrNull()
+            val end = parts[1].toLongOrNull()
+            if (start == null || end == null) {
+                null
+            } else {
+                TimeInterval(start, end)
+            }
+        }
+    }
+
+    private fun extractActiveId(document: Document): Int {
+        val scriptContent = document.select("script")
             .map { it.data() }
             .firstOrNull { it.contains("const fileList") }
             ?: throw AllohaParsingException("Failed to find active media id in Alloha script payload.")
-        val jsonString = regex.find(scriptContent)?.groupValues?.get(2)
+
+        val jsonString = fileListRegex.find(scriptContent)?.groupValues?.get(2)
             ?: throw AllohaParsingException("Failed to extract JSON from Alloha script.")
+
         val cleanJson = jsonString
             .replace("\\\"", "\"")
             .replace("\\\\", "\\")
+
         return try {
             json.decodeFromString<AllohaFileListDto>(cleanJson).active.id
         } catch (_: Exception) {
@@ -129,94 +175,103 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         }
     }
 
-    private fun a6(s: String): String {
-        val length = s.length
+    private fun decodeBorthSeed(seed: String): String {
+        return unscramble(reorderByBitWidth(reorderByBitDepth(seed)))
+    }
+
+    private fun reorderByBitWidth(source: String): String {
+        val length = source.length
         if (length <= 0) {
-            return s
+            return source
         }
+
         var u = 0
         while ((1 shl u) < length) {
             u++
         }
-        fun ax(z: Int): Int {
-            if (z == 0) {
+
+        fun bucketIndex(index: Int): Int {
+            if (index == 0) {
                 return u
             }
+
             var g = 0
-            var z = z
-            while ((1 and z) == 0) {
+            var value = index
+            while ((1 and value) == 0) {
                 g++
-                z = z shr 1
+                value = value shr 1
             }
             return g
         }
 
         val aj = IntArray(u + 1)
-        for (i in 0 until length) {
-            aj[ax(i)]++
+        for (index in 0 until length) {
+            aj[bucketIndex(index)]++
         }
 
-        val aE = Array(u + 1) { "" }
+        val buckets = Array(u + 1) { "" }
         var pos = 0
         for (i in 0..u) {
-            aE[i] = s.substring(pos, pos + aj[i])
+            buckets[i] = source.substring(pos, pos + aj[i])
             pos += aj[i]
         }
 
         val pointers = IntArray(u + 1)
         val res = CharArray(length)
-        for (i in 0 until length) {
-            val r = ax(i)
-            res[i] = aE[r][pointers[r]++]
+        for (index in 0 until length) {
+            val bucket = bucketIndex(index)
+            res[index] = buckets[bucket][pointers[bucket]++]
         }
 
         return String(res)
     }
 
-    private fun a7(s: String): String {
-        val length = s.length
+    private fun reorderByBitDepth(source: String): String {
+        val length = source.length
         if (length <= 0) {
-            return s
+            return source
         }
+
         var u = 0
         while ((1 shl u) < length) {
             u++
         }
-        fun ax(g: Int): Int {
-            if (g == 0) {
+
+        fun bucketIndex(index: Int): Int {
+            if (index == 0) {
                 return 0
             }
+
             var d = 0
-            var g = g
-            while (g > 0) {
+            var value = index
+            while (value > 0) {
                 d++
-                g = g shr 1
+                value = value shr 1
             }
             return d
         }
 
         val aj = IntArray(u + 1)
-        for (i in 0 until length) {
-            aj[ax(i)]++
+        for (index in 0 until length) {
+            aj[bucketIndex(index)]++
         }
 
-        val aE = Array(u + 1) { "" }
+        val buckets = Array(u + 1) { "" }
         var pos = 0
         for (i in u downTo 0) {
-            aE[i] = s.substring(pos, pos + aj[i])
+            buckets[i] = source.substring(pos, pos + aj[i])
             pos += aj[i]
         }
 
         val pointers = IntArray(u + 1)
         val res = CharArray(length)
-        for (i in 0 until length) {
-            val r = ax(i)
-            res[i] = aE[r][pointers[r]++]
+        for (index in 0 until length) {
+            val bucket = bucketIndex(index)
+            res[index] = buckets[bucket][pointers[bucket]++]
         }
 
         return String(res)
     }
-
 
     private fun isPrime(n: Int): Boolean {
         if (n < 2) return false
@@ -229,41 +284,41 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         return true
     }
 
-    private fun getNextPrime(n: Int): Int {
-        var c = maxOf(1, n)
-        while (!isPrime(c)) {
-            c++
+    private fun nextPrimeAtOrAbove(value: Int): Int {
+        var candidate = maxOf(1, value)
+        while (!isPrime(candidate)) {
+            candidate++
         }
-        return c
+        return candidate
     }
 
-    private fun unscramble(s: String): String {
-        val length = s.length
+    private fun unscramble(source: String): String {
+        val length = source.length
         if (length <= 1) {
-            return s
+            return source
         }
 
-        val ax = getNextPrime(length + 1)
+        val modulus = nextPrimeAtOrAbove(length + 1)
 
-        val aj = BooleanArray(length)
-        val ac = IntArray(length)
-        var acEl = 0
-        var aE = 0
+        val visited = BooleanArray(length)
+        val indexes = IntArray(length)
+        var filled = 0
+        var current = 0
 
-        while (acEl < length) {
-            aE = (aE + 2) % ax
-            if (aE < length && !aj[aE]) {
-                ac[acEl++] = aE
-                aj[aE] = true
+        while (filled < length) {
+            current = (current + 2) % modulus
+            if (current < length && !visited[current]) {
+                indexes[filled++] = current
+                visited[current] = true
             }
         }
 
-        val aA = CharArray(length)
-        for (av in 0 until length) {
-            aA[ac[av]] = s[av]
+        val decoded = CharArray(length)
+        for (index in 0 until length) {
+            decoded[indexes[index]] = source[index]
         }
 
-        return String(aA)
+        return String(decoded)
     }
 }
 
@@ -294,13 +349,13 @@ private data class AllohaTrackDto(
     val src: String,
     val language: String,
     @SerialName("default")
-    val isDefault: Boolean
+    val isDefault: Boolean = false
 )
 
-private sealed class AllohaParserException(message: String, cause: Throwable? = null) :
-    RuntimeException(message, cause)
+sealed class AllohaParserException(message: String, cause: Throwable? = null) :
+    ParserException(message, cause)
 
-private class AllohaApiException(message: String) : AllohaParserException(message)
+class AllohaApiException(message: String) : AllohaParserException(message)
 
-private class AllohaParsingException(message: String, cause: Throwable? = null) :
+class AllohaParsingException(message: String, cause: Throwable? = null) :
     AllohaParserException(message, cause)
