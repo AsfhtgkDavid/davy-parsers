@@ -14,7 +14,7 @@ Add the dependency to your `pom.xml`:
 <dependency>
     <groupId>dev.daika</groupId>
     <artifactId>davy-parsers</artifactId>
-    <version>1.0</version>
+    <version>1.0.0</version>
 </dependency>
 ```
 
@@ -22,7 +22,7 @@ Or with Gradle Kotlin DSL:
 
 ```kotlin
 dependencies {
-    implementation("dev.daika:davy-parsers:1.0")
+    implementation("dev.daika:davy-parsers:1.0.0")
 }
 ```
 
@@ -30,7 +30,7 @@ Or with Gradle Groovy DSL:
 
 ```groovy
 dependencies {
-    implementation 'dev.daika:davy-parsers:1.0'
+    implementation 'dev.daika:davy-parsers:1.0.0'
 }
 ```
 
