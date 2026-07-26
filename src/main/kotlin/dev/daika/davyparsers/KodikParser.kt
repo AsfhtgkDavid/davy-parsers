@@ -38,11 +38,9 @@ class KodikParser(client: OkHttpClient) : Parser {
                 throw KodikApiException("Failed to fetch iframe content")
             }
 
-            response.body.use { body ->
-                html = body.string()
-                urlParams = parseUrlParams(html)
-                hashContainer = parseHashContainer(html)
-            }
+            html = response.body.string()
+            urlParams = parseUrlParams(html)
+            hashContainer = parseHashContainer(html)
         }
 
         val doc = Jsoup.parse(html, iframeUrl)
@@ -148,14 +146,12 @@ class KodikParser(client: OkHttpClient) : Parser {
                     throw KodikApiException("Kodik API request failed with HTTP ${response.code} at $targetUrl.")
                 }
 
-                response.body.use { body ->
-                    body.string()
-                        .also {
-                            if (it.isBlank()) {
-                                throw KodikApiException("Kodik API returned an empty response while fetching streams.")
-                            }
+                response.body.string()
+                    .also {
+                        if (it.isBlank()) {
+                            throw KodikApiException("Kodik API returned an empty response while fetching streams.")
                         }
-                }
+                    }
             }
         } catch (e: KodikParserException) {
             throw e

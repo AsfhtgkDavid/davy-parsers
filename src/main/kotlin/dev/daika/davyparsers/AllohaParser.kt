@@ -55,9 +55,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
                 throw AllohaApiException("Failed to fetch iframe content.")
             }
 
-            response.body.use { body ->
-                Jsoup.parse(body.byteStream(), "UTF-8", response.request.url.toString())
-            }
+            Jsoup.parse(response.body.byteStream(), "UTF-8", response.request.url.toString())
         }
     }
 
@@ -90,17 +88,15 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
                 throw AllohaApiException("Alloha BNSI request failed with HTTP ${response.code}.")
             }
 
-            response.body.use { body ->
-                val rawBody = body.string()
-                if (rawBody.isBlank()) {
-                    throw AllohaApiException("Alloha BNSI response body is empty.")
-                }
+            val rawBody = response.body.string()
+            if (rawBody.isBlank()) {
+                throw AllohaApiException("Alloha BNSI response body is empty.")
+            }
 
-                try {
-                    json.decodeFromString<AllohaBnsiDto>(rawBody)
-                } catch (e: Exception) {
-                    throw AllohaParsingException("Failed to decode Alloha BNSI response JSON.", e)
-                }
+            try {
+                json.decodeFromString<AllohaBnsiDto>(rawBody)
+            } catch (e: Exception) {
+                throw AllohaParsingException("Failed to decode Alloha BNSI response JSON.", e)
             }
         }
     }
@@ -124,7 +120,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
                     }
                 )
             },
-            skipTimes = parseSkipTimes(bnsiDto.skipTime),
+            skipTimes = if (bnsiDto.skipTime != null) parseSkipTimes(bnsiDto.skipTime) else emptyList(),
             subtitles = bnsiDto.tracks?.map { track ->
                 SubtitleTrack(
                     kind = track.kind,
@@ -333,7 +329,7 @@ private data class AllohaFileListEntityDto(val id: Int)
 
 @Serializable
 private data class AllohaBnsiDto(
-    val skipTime: String,
+    val skipTime: String? = null,
     val hlsSource: List<AllohaHlsSourceDto>,
     val tracks: List<AllohaTrackDto>?
 )
