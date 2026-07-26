@@ -4,7 +4,8 @@ package dev.daika.davyparsers
 data class Translation(
     val id: String,
     val name: String,
-    val streams: List<MediaStream>
+    val streams: List<MediaStream>,
+    val isDefault: Boolean = false
 )
 
 /** Describes a playable stream variant for a specific quality. */

@@ -68,7 +68,8 @@ class KodikParser(client: OkHttpClient) : Parser {
                     Translation(
                         id = transInfo.id,
                         name = transInfo.name,
-                        streams = parseStreams(videoData)
+                        streams = parseStreams(videoData),
+                        isDefault = transInfo.id == "0"
                     )
                 )
 

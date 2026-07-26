@@ -117,7 +117,8 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
                     name = source.label,
                     streams = source.quality.map { (quality, url) ->
                         MediaStream(urls = parseUrls(url), quality = quality)
-                    }
+                    },
+                    isDefault = source.isDefault
                 )
             },
             skipTimes = if (bnsiDto.skipTime != null) parseSkipTimes(bnsiDto.skipTime) else emptyList(),
@@ -338,7 +339,9 @@ private data class AllohaBnsiDto(
 private data class AllohaHlsSourceDto(
     val label: String,
     val quality: Map<String, String>,
-    val audioId: String
+    val audioId: String,
+    @SerialName("default")
+    val isDefault: Boolean = false
 )
 
 @Serializable
