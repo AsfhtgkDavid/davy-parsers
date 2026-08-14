@@ -86,7 +86,10 @@ class KodikParser(client: OkHttpClient) : Parser {
         return PlayerData(
             translations = populatedTranslations,
             skipTimes = skipTimes,
-            subtitles = allSubtitles
+            subtitles = allSubtitles,
+            headers = mapOf(
+                "Origin" to iframeUrl
+            )
         )
     }
 

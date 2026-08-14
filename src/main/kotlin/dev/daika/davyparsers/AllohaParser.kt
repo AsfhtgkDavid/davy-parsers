@@ -4,6 +4,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.FormBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -17,9 +18,9 @@ private const val userAgent =
 private const val acceptLanguage = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 private const val allohaOrigin = "https://alloha.yani.tv"
 private const val allohaBnsiPath = "$allohaOrigin/bnsi/movies"
-private val formMediaType = "application/x-www-form-urlencoded; charset=UTF-8".toMediaType()
 private val fileListRegex =
     """const\s+fileList\s*=\s*JSON\.parse\(\s*(["'`])(.*?)\1\s*\)""".toRegex(RegexOption.DOT_MATCHES_ALL)
+private val apiKeyRegex = """['"]([a-zA-Z0-9]{360,420})['"]""".toRegex(RegexOption.DOT_MATCHES_ALL)
 
 /** A parser implementation for the Alloha player source. */
 class AllohaParser(private val client: OkHttpClient) : Parser {
@@ -36,7 +37,8 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         val borth = buildBorthHeader(requestSeed)
         val activeId = extractActiveId(iframeDocument)
         val bnsiDto = fetchBnsiData(activeId, token, borth, iframeUrl)
-        return mapPlayerData(bnsiDto)
+        val headers = fetchHeaders(iframeUrl, iframeDocument)
+        return mapPlayerData(bnsiDto, headers)
     }
 
     override fun canParse(iframeUrl: String): Boolean {
@@ -109,7 +111,26 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         .add("subtitle", "")
         .build()
 
-    private fun mapPlayerData(bnsiDto: AllohaBnsiDto): PlayerData {
+    private suspend fun fetchHeaders(iframeUrl: String, document: Document): Map<String, String> {
+        val headers = mutableMapOf<String, String>()
+        headers["Origin"] = iframeUrl
+        document.select("script").mapNotNull { it.attr("src") }.forEach { script ->
+            val request = Request.Builder().url("https://${iframeUrl.toHttpUrl().host}/$script")
+                .build()
+            client.newCall(request).await().use { response ->
+                if (response.isSuccessful) {
+                    val body = response.body.string()
+                    val apiKeyMatch = apiKeyRegex.find(body)
+                    if (apiKeyMatch != null) {
+                        headers["Authorizations"] = "Bearer ${apiKeyMatch.groupValues[1]}"
+                    }
+                }
+            }
+        }
+        return headers
+    }
+
+    private fun mapPlayerData(bnsiDto: AllohaBnsiDto, headers: Map<String, String>): PlayerData {
         return PlayerData(
             translations = bnsiDto.hlsSource.map { source ->
                 Translation(
@@ -130,7 +151,8 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
                     src = track.src,
                     isDefault = track.isDefault
                 )
-            } ?: emptyList()
+            } ?: emptyList(),
+            headers = headers
         )
     }
 

@@ -33,5 +33,6 @@ data class SubtitleTrack(
 data class PlayerData(
     val translations: List<Translation>,
     val skipTimes: List<TimeInterval> = emptyList(),
-    val subtitles: List<SubtitleTrack> = emptyList()
+    val subtitles: List<SubtitleTrack> = emptyList(),
+    val headers: Map<String, String> = emptyMap()
 )
