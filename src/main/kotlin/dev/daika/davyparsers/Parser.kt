@@ -7,16 +7,29 @@ interface Parser {
     /** Parses the given iframe URL into player data.
      *  @param iframeUrl The URL of the iframe to parse.
      *  @param referer The referer URL to use for the request.
+     *  @param onHeadersChanged A callback that is invoked when the headers change during parsing. Sends only the changed headers.
      *  @return The parsed player data.
      *  @throws ParserException If an error occurs while parsing.
      */
-    suspend fun parse(iframeUrl: String, referer: String): PlayerData
+    suspend fun parse(iframeUrl: String, referer: String, onHeadersChanged: (Map<String, String>) -> Unit): PlayerData
 
     /** Determines if this parser can handle the given iframe URL.
      *  @param iframeUrl The URL of the iframe to check.
      *  @return True if this parser can handle the URL, false otherwise.
      */
     fun canParse(iframeUrl: String): Boolean
+
+    /** Closes any resources associated with this parser. */
+    fun closeSession() {
+        // Default implementation does nothing.
+    }
+
+    /** Sends an event to the server.
+     *  @param event The event to send.
+     */
+    fun sendEvent(event: ParserEvent) {
+        // Default implementation does nothing.
+    }
 
     companion object {
         /** Returns a list of all available parsers.
@@ -43,3 +56,15 @@ interface Parser {
 
 /** Represents an exception that occurs during parsing. */
 sealed class ParserException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+
+/** Represents an event that parser should send to the server. */
+sealed interface ParserEvent {
+    data class RESUMED(val currentTime: Long) : ParserEvent
+    data class PAUSED(val currentTime: Long) : ParserEvent
+    data class SEEKED(val currentTime: Long) : ParserEvent
+    data class TRACK_CHANGED(
+        val currentTime: Long,
+        val resolution: String,
+        val audioId: String
+    ) : ParserEvent
+}

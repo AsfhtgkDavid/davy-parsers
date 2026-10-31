@@ -18,7 +18,11 @@ private val json = Json { ignoreUnknownKeys = true }
 /** A parser implementation for the Kodik player source. */
 class KodikParser(client: OkHttpClient) : Parser {
     private val client: OkHttpClient = client.newBuilder().cookieJar(InMemoryCookieJar()).build()
-    override suspend fun parse(iframeUrl: String, referer: String): PlayerData {
+    override suspend fun parse(
+        iframeUrl: String,
+        referer: String,
+        onHeadersChanged: (Map<String, String>) -> Unit
+    ): PlayerData {
         val requestIframe = Request.Builder().url(iframeUrl).addHeader(
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"

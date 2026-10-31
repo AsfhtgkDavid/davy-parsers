@@ -1,35 +1,68 @@
 package dev.daika.davyparsers
 
+import kotlinx.coroutines.*
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import okhttp3.FormBody
+import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import java.net.URLEncoder
+import java.security.MessageDigest
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.min
+import kotlin.math.pow
 
 private const val userAgent =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0"
 private const val acceptLanguage = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 private const val allohaOrigin = "https://alloha.yani.tv"
 private const val allohaBnsiPath = "$allohaOrigin/bnsi/movies"
+private const val clientFingerprintHash = "d2c8a63ca1d2ac9885ddce7c8478f780d67a6bd9268d39342c35a19b6641260b"
 private val fileListRegex =
     """const\s+fileList\s*=\s*JSON\.parse\(\s*(["'`])(.*?)\1\s*\)""".toRegex(RegexOption.DOT_MATCHES_ALL)
-private val apiKeyRegex = """['"]([a-zA-Z0-9]{360,420})['"]""".toRegex(RegexOption.DOT_MATCHES_ALL)
+private val apiKeyRegex = """['"]([a-zA-Z0-9]{340,420})['"]""".toRegex(RegexOption.DOT_MATCHES_ALL)
 
 /** A parser implementation for the Alloha player source. */
 class AllohaParser(private val client: OkHttpClient) : Parser {
-    private val json = Json {
-        ignoreUnknownKeys = true
+    private val json = Json { ignoreUnknownKeys = true }
 
+    private val wsClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .pingInterval(20, TimeUnit.SECONDS)
+            .build()
     }
 
-    override suspend fun parse(iframeUrl: String, referer: String): PlayerData {
+    private val wsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var activeWebSocket: WebSocket? = null
+    private var heartbeatJob: Job? = null
+    private var reconnectJob: Job? = null
+    private var bnsiRefreshJob: Job? = null
+    private var onHeadersChanged: ((Map<String, String>) -> Unit)? = null
+
+    private var savedPnr: String? = null
+    private var savedPnk: String? = null
+    private var currentResolution: String = "1080"
+    private var currentAudioId: String = "1"
+
+    private val currentPlaybackTimeSec = AtomicLong(0L)
+    private val isPlaying = AtomicBoolean(true)
+    private val isSessionClosed = AtomicBoolean(false)
+    private var reconnectAttempts = 0
+
+    override suspend fun parse(
+        iframeUrl: String,
+        referer: String,
+        onHeadersChanged: (Map<String, String>) -> Unit
+    ): PlayerData {
+        this.onHeadersChanged = onHeadersChanged
         val iframeDocument = loadIframeDocument(iframeUrl, referer)
         val requestSeed = iframeDocument.selectFirst("meta[name=viewporti]")?.attr("content")
             ?: throw AllohaParsingException("Missing viewporti metadata required for request signing.")
@@ -37,12 +70,288 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         val borth = buildBorthHeader(requestSeed)
         val activeId = extractActiveId(iframeDocument)
         val bnsiDto = fetchBnsiData(activeId, token, borth, iframeUrl)
-        val headers = fetchHeaders(iframeUrl, iframeDocument)
+
+        val defaultSource = bnsiDto.hlsSource.firstOrNull { it.isDefault } ?: bnsiDto.hlsSource.first()
+        val defaultQuality = when {
+            defaultSource.quality.containsKey("1080") -> "1080"
+            defaultSource.quality.containsKey("720") -> "720"
+            else -> defaultSource.quality.keys.firstOrNull() ?: "720"
+        }
+
+        val edgeHash = if (!bnsiDto.pnr.isNullOrBlank() && !bnsiDto.pnk.isNullOrBlank()) {
+            startWebSocketSession(
+                pnr = bnsiDto.pnr,
+                pnk = bnsiDto.pnk,
+                resolution = defaultQuality,
+                audioId = defaultSource.audioId
+            )
+        } else {
+            null
+        }
+
+        val headers = fetchHeaders(
+            iframeUrl = iframeUrl,
+            document = iframeDocument,
+            acceptsControls = edgeHash ?: clientFingerprintHash
+        )
         return mapPlayerData(bnsiDto, headers)
     }
 
     override fun canParse(iframeUrl: String): Boolean {
         return iframeUrl.contains("alloha.yani.tv")
+    }
+
+    private suspend fun resolveWorkingUrls(urls: List<String>, headers: Map<String, String>): List<String> {
+        if (urls.size <= 1) return urls
+
+        // Быстрая проверка первого зеркала
+        val firstUrl = urls.first()
+        val isFirstWorking = withContext(Dispatchers.IO) {
+            try {
+                val reqBuilder = Request.Builder().url(firstUrl).head()
+                headers.forEach { (k, v) -> reqBuilder.header(k, v) }
+                client.newCall(reqBuilder.build()).execute().use { response ->
+                    response.isSuccessful
+                }
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        // Если первое зеркало выдало 403 / ошибку — меняем порядок, ставя рабочее первым
+        return if (isFirstWorking) {
+            urls
+        } else {
+            urls.reversed()
+        }
+    }
+
+    override fun sendEvent(event: ParserEvent) {
+        when (event) {
+            is ParserEvent.RESUMED -> {
+                currentPlaybackTimeSec.set(event.currentTime)
+                isPlaying.set(true)
+                sendWsEvent("playback_start", event.currentTime)
+                sendWsEvent("resumed", event.currentTime)
+                startHeartbeat()
+            }
+
+            is ParserEvent.PAUSED -> {
+                currentPlaybackTimeSec.set(event.currentTime)
+                isPlaying.set(false)
+                stopHeartbeat()
+                sendWsEvent("paused", event.currentTime)
+            }
+
+            is ParserEvent.SEEKED -> {
+                currentPlaybackTimeSec.set(event.currentTime)
+                sendWsEvent("seeked", event.currentTime)
+            }
+
+            is ParserEvent.TRACK_CHANGED -> {
+                currentPlaybackTimeSec.set(event.currentTime)
+                currentResolution = event.resolution
+                currentAudioId = event.audioId
+                sendWsEvent("playback_start", event.currentTime)
+                sendWsEvent("resumed", event.currentTime)
+            }
+        }
+    }
+
+    override fun closeSession() {
+        isSessionClosed.set(true)
+        stopHeartbeat()
+        reconnectJob?.cancel()
+        reconnectJob = null
+        bnsiRefreshJob?.cancel()
+        bnsiRefreshJob = null
+        savedPnr = null
+        savedPnk = null
+        activeWebSocket?.close(1000, null)
+        activeWebSocket = null
+    }
+
+    private suspend fun startWebSocketSession(
+        pnr: String,
+        pnk: String,
+        resolution: String,
+        audioId: String
+    ): String? {
+        closeSession()
+        isSessionClosed.set(false)
+        savedPnr = pnr
+        savedPnk = pnk
+        currentResolution = resolution
+        currentAudioId = audioId
+        currentPlaybackTimeSec.set(0L)
+        isPlaying.set(true)
+        reconnectAttempts = 0
+
+        val initialEdgeHash = CompletableDeferred<String?>()
+        connectWebSocket(initialEdgeHash)
+        startHeartbeat()
+
+        return withTimeoutOrNull(4_000L) {
+            initialEdgeHash.await()
+        }
+    }
+
+    private suspend fun fetchHeaders(
+        iframeUrl: String,
+        document: Document,
+        acceptsControls: String
+    ): Map<String, String> {
+        val originHost = "https://${iframeUrl.toHttpUrl().host}"
+        val headers = mutableMapOf(
+            "Origin" to originHost,
+            "Referer" to "$originHost/",
+            "User-Agent" to userAgent,
+            "Accept-Language" to acceptLanguage,
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "cross-site",
+            "Accepts-Controls" to acceptsControls
+        )
+
+        val appScript = document.select("script[src]")
+            .mapNotNull { it.attr("src") }
+            .firstOrNull { it.contains("/app.") || it.contains("app.") }
+
+        if (appScript != null) {
+            val scriptUrl = if (appScript.startsWith("http")) appScript else "$originHost/${
+                appScript.removePrefix("./").removePrefix("/")
+            }"
+            val request = Request.Builder()
+                .url(scriptUrl)
+                .header("User-Agent", userAgent)
+                .header("Referer", iframeUrl)
+                .build()
+
+            client.newCall(request).await().use { response ->
+                if (response.isSuccessful) {
+                    val body = response.body.string()
+                    val apiKeyMatch = apiKeyRegex.find(body)
+                    if (apiKeyMatch != null) {
+                        headers["Authorizations"] = "Bearer ${apiKeyMatch.groupValues[1]}"
+                    }
+                }
+            }
+        }
+
+        return headers
+    }
+
+    private fun connectWebSocket(initialEdgeHash: CompletableDeferred<String?>? = null) {
+        val pnr = savedPnr ?: return
+        val pnk = savedPnk ?: return
+        if (isSessionClosed.get()) return
+
+        val encodedSid = URLEncoder.encode(pnk, "UTF-8")
+        val wsUrl = "$pnr?sid=$encodedSid&v=2.1&t=${System.currentTimeMillis()}"
+
+        val request = Request.Builder()
+            .url(wsUrl)
+            .header("User-Agent", userAgent)
+            .header("Origin", allohaOrigin)
+            .header("Accept-Language", acceptLanguage)
+            .build()
+
+        activeWebSocket = wsClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                reconnectAttempts = 0
+                val startMsg = buildWsPayload(
+                    type = "playback_start",
+                    currentTime = currentPlaybackTimeSec.get(),
+                    resolution = currentResolution,
+                    trackId = currentAudioId
+                )
+                webSocket.send(startMsg)
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val msg = json.decodeFromString<AllohaWsConfigUpdateDto>(text)
+                    if (msg.type == "config_update" && !msg.edgeHash.isNullOrBlank()) {
+                        onHeadersChanged?.invoke(mapOf("Accepts-Controls" to msg.edgeHash))
+                        initialEdgeHash?.let {
+                            if (!it.isCompleted) it.complete(msg.edgeHash)
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                initialEdgeHash?.let {
+                    if (!it.isCompleted) it.complete(null)
+                }
+                scheduleReconnect()
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                initialEdgeHash?.let {
+                    if (!it.isCompleted) it.complete(null)
+                }
+                if (code != 1000) {
+                    scheduleReconnect()
+                }
+            }
+        })
+    }
+
+    private fun scheduleReconnect() {
+        if (isSessionClosed.get() || reconnectAttempts >= 30) return
+        reconnectJob?.cancel()
+        reconnectJob = wsScope.launch {
+            val delayMs = min((1000.0 * 1.5.pow(reconnectAttempts.toDouble())).toLong(), 15_000L)
+            reconnectAttempts++
+            delay(delayMs)
+            if (!isSessionClosed.get()) {
+                connectWebSocket(null)
+            }
+        }
+    }
+
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = wsScope.launch {
+            while (isActive && !isSessionClosed.get()) {
+                delay(15_000L)
+                if (isPlaying.get()) {
+                    val timeSec = currentPlaybackTimeSec.addAndGet(15L)
+                    sendWsEvent("playing", timeSec)
+                }
+            }
+        }
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+    }
+
+    private fun sendWsEvent(type: String, currentTimeSec: Long) {
+        val ws = activeWebSocket ?: return
+        val payload = buildWsPayload(
+            type = type,
+            currentTime = currentTimeSec,
+            resolution = currentResolution,
+            trackId = currentAudioId
+        )
+        val sent = ws.send(payload)
+        if (!sent && !isSessionClosed.get()) {
+            scheduleReconnect()
+        }
+    }
+
+    private fun buildWsPayload(
+        type: String,
+        currentTime: Long,
+        resolution: String,
+        trackId: String
+    ): String {
+        val ts = System.currentTimeMillis()
+        return """{"type":"$type","current_time":$currentTime,"resolution":"$resolution","track_id":"$trackId","speed":1,"subtitle":-1,"ts":$ts}"""
     }
 
     private suspend fun loadIframeDocument(iframeUrl: String, referer: String): Document {
@@ -56,7 +365,6 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
             if (!response.isSuccessful) {
                 throw AllohaApiException("Failed to fetch iframe content.")
             }
-
             Jsoup.parse(response.body.byteStream(), "UTF-8", response.request.url.toString())
         }
     }
@@ -67,7 +375,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
     }
 
     private fun buildBorthHeader(requestSeed: String): String {
-        return "a|" + decodeBorthSeed(requestSeed)
+        return "$clientFingerprintHash|${decodeBorthSeed(requestSeed)}"
     }
 
     private suspend fun fetchBnsiData(
@@ -82,6 +390,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
             .addHeader("Borth", borth)
             .addHeader("Referer", iframeUrl)
             .addHeader("Origin", allohaOrigin)
+            .addHeader("X-Requested-With", "XMLHttpRequest")
             .addHeader("Accept-Language", acceptLanguage)
             .build()
 
@@ -111,44 +420,33 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         .add("subtitle", "")
         .build()
 
-    private suspend fun fetchHeaders(iframeUrl: String, document: Document): Map<String, String> {
-        val headers = mutableMapOf<String, String>()
-        headers["Origin"] = iframeUrl
-        document.select("script").mapNotNull { it.attr("src") }.forEach { script ->
-            val request = Request.Builder().url("https://${iframeUrl.toHttpUrl().host}/$script")
-                .build()
-            client.newCall(request).await().use { response ->
-                if (response.isSuccessful) {
-                    val body = response.body.string()
-                    val apiKeyMatch = apiKeyRegex.find(body)
-                    if (apiKeyMatch != null) {
-                        headers["Authorizations"] = "Bearer ${apiKeyMatch.groupValues[1]}"
-                    }
-                }
-            }
-        }
-        return headers
-    }
+    private suspend fun mapPlayerData(bnsiDto: AllohaBnsiDto, headers: Map<String, String>): PlayerData {
+        val guard = headers["Authorizations"]?.removePrefix("Bearer ")?.trim().orEmpty()
+        val ac = headers["Accepts-Controls"].orEmpty()
 
-    private fun mapPlayerData(bnsiDto: AllohaBnsiDto, headers: Map<String, String>): PlayerData {
         return PlayerData(
             translations = bnsiDto.hlsSource.map { source ->
                 Translation(
                     id = source.audioId,
                     name = source.label,
                     streams = source.quality.map { (quality, url) ->
-                        MediaStream(urls = parseUrls(url), quality = quality)
+                        MediaStream(urls = resolveWorkingUrls(parseUrls(url), headers), quality = quality)
                     },
                     isDefault = source.isDefault
                 )
             },
             skipTimes = if (bnsiDto.skipTime != null) parseSkipTimes(bnsiDto.skipTime) else emptyList(),
             subtitles = bnsiDto.tracks?.map { track ->
+                val signedSrc = if (guard.isNotEmpty() && ac.isNotEmpty()) {
+                    "${track.src}?t=$guard&ac=$ac"
+                } else {
+                    track.src
+                }
                 SubtitleTrack(
                     kind = track.kind,
                     label = track.label,
                     language = track.language,
-                    src = track.src,
+                    src = signedSrc,
                     isDefault = track.isDefault
                 )
             } ?: emptyList(),
@@ -354,7 +652,17 @@ private data class AllohaFileListEntityDto(val id: Int)
 private data class AllohaBnsiDto(
     val skipTime: String? = null,
     val hlsSource: List<AllohaHlsSourceDto>,
-    val tracks: List<AllohaTrackDto>?
+    val tracks: List<AllohaTrackDto>? = null,
+    val pnr: String? = null,
+    val pnk: String? = null,
+    val time: Long? = null
+)
+
+@Serializable
+private data class AllohaWsConfigUpdateDto(
+    val type: String? = null,
+    @SerialName("edge_hash")
+    val edgeHash: String? = null
 )
 
 @Serializable

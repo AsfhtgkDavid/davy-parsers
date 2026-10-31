@@ -14,7 +14,7 @@ Add the dependency to your `pom.xml`:
 <dependency>
     <groupId>dev.daika</groupId>
     <artifactId>davy-parsers</artifactId>
-    <version>1.2.0</version>
+    <version>1.3.0</version>
 </dependency>
 ```
 
@@ -22,7 +22,7 @@ Or with Gradle Kotlin DSL:
 
 ```kotlin
 dependencies {
-    implementation("dev.daika:davy-parsers:1.2.0")
+    implementation("dev.daika:davy-parsers:1.3.0")
 }
 ```
 
@@ -30,7 +30,7 @@ Or with Gradle Groovy DSL:
 
 ```groovy
 dependencies {
-    implementation 'dev.daika:davy-parsers:1.2.0'
+    implementation 'dev.daika:davy-parsers:1.3.0'
 }
 ```
 
@@ -47,7 +47,11 @@ val referer = "https://example.com"
 val parser = Parser.getParserForUrl(iframeUrl, Parser.getAllParsers(client))
     ?: error("Unsupported iframe URL")
 
-val playerData = parser.parse(iframeUrl, referer)
+val playerData = parser.parse(iframeUrl, referer) { /* Callback to change headers */ }
+
+// Use the playerData object as needed
+
+parser.closeSession()
 ```
 
 `parse()` is a suspending function, so call it from a coroutine.
