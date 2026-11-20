@@ -65,6 +65,7 @@ sealed interface ParserEvent {
     data class TRACK_CHANGED(
         val currentTime: Long,
         val resolution: String,
-        val audioId: String
+        val audioId: String,
+        val subtitleId: Int
     ) : ParserEvent
 }

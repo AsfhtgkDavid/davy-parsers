@@ -51,6 +51,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
     private var savedPnk: String? = null
     private var currentResolution: String = "1080"
     private var currentAudioId: String = "1"
+    private var currentSubtitleId: Int = -1
 
     private val currentPlaybackTimeSec = AtomicLong(0L)
     private val isPlaying = AtomicBoolean(true)
@@ -77,18 +78,22 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
             defaultSource.quality.containsKey("720") -> "720"
             else -> defaultSource.quality.keys.firstOrNull() ?: "720"
         }
+        val defaultSubtitleId = bnsiDto.tracks
+            ?.indexOfFirst { it.isDefault }
+            ?.takeIf { it >= 0 }
+            ?: -1
 
         val edgeHash = if (!bnsiDto.pnr.isNullOrBlank() && !bnsiDto.pnk.isNullOrBlank()) {
             startWebSocketSession(
                 pnr = bnsiDto.pnr,
                 pnk = bnsiDto.pnk,
                 resolution = defaultQuality,
-                audioId = defaultSource.audioId
+                audioId = defaultSource.audioId,
+                subtitleId = defaultSubtitleId
             )
         } else {
             null
         }
-
         val headers = fetchHeaders(
             iframeUrl = iframeUrl,
             document = iframeDocument,
@@ -152,6 +157,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
                 currentPlaybackTimeSec.set(event.currentTime)
                 currentResolution = event.resolution
                 currentAudioId = event.audioId
+                currentSubtitleId = event.subtitleId
                 sendWsEvent("playback_start", event.currentTime)
                 sendWsEvent("resumed", event.currentTime)
             }
@@ -175,7 +181,8 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         pnr: String,
         pnk: String,
         resolution: String,
-        audioId: String
+        audioId: String,
+        subtitleId: Int
     ): String? {
         closeSession()
         isSessionClosed.set(false)
@@ -183,6 +190,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         savedPnk = pnk
         currentResolution = resolution
         currentAudioId = audioId
+        currentSubtitleId = subtitleId
         currentPlaybackTimeSec.set(0L)
         isPlaying.set(true)
         reconnectAttempts = 0
@@ -263,7 +271,8 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
                     type = "playback_start",
                     currentTime = currentPlaybackTimeSec.get(),
                     resolution = currentResolution,
-                    trackId = currentAudioId
+                    trackId = currentAudioId,
+                    subtitleId = currentSubtitleId
                 )
                 webSocket.send(startMsg)
             }
@@ -336,6 +345,7 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
             type = type,
             currentTime = currentTimeSec,
             resolution = currentResolution,
+            subtitleId = currentSubtitleId,
             trackId = currentAudioId
         )
         val sent = ws.send(payload)
@@ -348,10 +358,11 @@ class AllohaParser(private val client: OkHttpClient) : Parser {
         type: String,
         currentTime: Long,
         resolution: String,
+        subtitleId: Int,
         trackId: String
     ): String {
         val ts = System.currentTimeMillis()
-        return """{"type":"$type","current_time":$currentTime,"resolution":"$resolution","track_id":"$trackId","speed":1,"subtitle":-1,"ts":$ts}"""
+        return """{"type":"$type","current_time":$currentTime,"resolution":"$resolution","track_id":"$trackId","speed":1,"subtitle":$subtitleId,"ts":$ts}"""
     }
 
     private suspend fun loadIframeDocument(iframeUrl: String, referer: String): Document {
